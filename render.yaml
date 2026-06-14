@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: chkr-mirror
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: ORIGIN_HOST
+        value: hchk.cards
+      - key: ORIGIN_PROTOCOL
+        value: https
+      - key: FORCE_INDEXABLE
+        value: "true"
+      - key: ENABLE_RIGHT_CLICK
+        value: "true"
+      # Isi setelah tahu URL Render kamu, mis. https://chkr-mirror.onrender.com
+      - key: PUBLIC_URL
+        value: ""

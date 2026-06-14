@@ -1,0 +1,17 @@
+{
+  "name": "chkr-mirror",
+  "version": "1.0.0",
+  "description": "Reverse-proxy full mirror with SEO fixes (canonical, sitemap, redirect, structured data) and right-click enabler. Deployable to Railway, Render, or a VPS.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
