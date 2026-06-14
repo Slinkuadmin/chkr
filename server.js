@@ -13,6 +13,7 @@ app.disable('x-powered-by');
 // Cache in-memory sederhana untuk static asset (kurangi hit ke origin -> hindari 429).
 const assetCache = new Map(); // key -> { status, headers, body, expires }
 const ASSET_TTL_MS = 1000 * 60 * 10; // 10 menit
+const HTML_TTL_MS = 1000 * 60; // 1 menit untuk halaman HTML anonim
 const ASSET_CACHE_MAX = 500;
 
 function cacheableAssetPath(path) {
@@ -31,13 +32,13 @@ function getCache(key) {
   return hit;
 }
 
-function setCache(key, value) {
+function setCache(key, value, ttl = ASSET_TTL_MS) {
   if (assetCache.size >= ASSET_CACHE_MAX) {
     // Buang entri terlama.
     const firstKey = assetCache.keys().next().value;
     assetCache.delete(firstKey);
   }
-  assetCache.set(key, { ...value, expires: Date.now() + ASSET_TTL_MS });
+  assetCache.set(key, { ...value, expires: Date.now() + ttl });
 }
 
 // Header response dari origin yang tidak boleh diteruskan apa adanya.
@@ -115,14 +116,28 @@ function buildOriginHeaders(req, ctx) {
     headers[key] = value;
   }
   headers['host'] = config.originHost;
-  // Pastikan API yang butuh konteks browser tidak menolak request.
-  if (!headers['user-agent'] && !headers['User-Agent']) {
+  // Lengkapi header agar request terlihat seperti browser asli (mengurangi
+  // kemungkinan Cloudflare menandai sebagai bot/proxy -> penyebab 429).
+  const has = (name) => Object.keys(headers).some((h) => h.toLowerCase() === name);
+  if (!has('user-agent')) {
     headers['user-agent'] =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   }
-  if (!headers['accept'] && !headers['Accept']) {
-    headers['accept'] = '*/*';
+  if (!has('accept')) {
+    headers['accept'] =
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
   }
+  if (!has('accept-language')) headers['accept-language'] = 'en-US,en;q=0.9';
+  if (!has('sec-ch-ua')) {
+    headers['sec-ch-ua'] =
+      '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"';
+  }
+  if (!has('sec-ch-ua-mobile')) headers['sec-ch-ua-mobile'] = '?0';
+  if (!has('sec-ch-ua-platform')) headers['sec-ch-ua-platform'] = '"Windows"';
+  if (!has('sec-fetch-dest')) headers['sec-fetch-dest'] = 'document';
+  if (!has('sec-fetch-mode')) headers['sec-fetch-mode'] = 'navigate';
+  if (!has('sec-fetch-site')) headers['sec-fetch-site'] = 'same-origin';
+  if (!has('upgrade-insecure-requests')) headers['upgrade-insecure-requests'] = '1';
   headers['accept-encoding'] = 'gzip, deflate, br';
   return headers;
 }
@@ -255,6 +270,24 @@ app.use(async (req, res) => {
     }
   }
 
+  // Cache halaman HTML untuk pengunjung anonim (tanpa cookie/sesi) -> kurangi
+  // hit ke origin dan redam 429. Halaman ber-login tidak ikut di-cache.
+  const isAnonHtmlGet =
+    req.method === 'GET' &&
+    !req.headers.cookie &&
+    !cacheableAssetPath(req.originalUrl) &&
+    (req.headers.accept || '').includes('text/html');
+  if (isAnonHtmlGet) {
+    const cached = getCache('html:' + targetUrl);
+    if (cached) {
+      res.status(cached.status);
+      for (const [k, v] of Object.entries(cached.headers)) res.setHeader(k, v);
+      res.setHeader('x-mirror-cache', 'HIT');
+      res.end(cached.body);
+      return;
+    }
+  }
+
   try {
     const reqHeaders = buildOriginHeaders(req, ctx);
 
@@ -323,6 +356,24 @@ app.use(async (req, res) => {
         headers: { ...outHeaders, 'content-length': bodyBuf.length },
         body: bodyBuf,
       });
+    }
+
+    // Simpan halaman HTML anonim (tanpa Set-Cookie) dengan TTL pendek.
+    if (
+      isAnonHtmlGet &&
+      originRes.status === 200 &&
+      isHtml(contentType) &&
+      setCookies.length === 0
+    ) {
+      setCache(
+        'html:' + targetUrl,
+        {
+          status: 200,
+          headers: { ...outHeaders, 'content-length': bodyBuf.length },
+          body: bodyBuf,
+        },
+        HTML_TTL_MS
+      );
     }
 
     res.end(bodyBuf);
