@@ -58,18 +58,64 @@ function buildOriginHeaders(req, ctx) {
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const k = key.toLowerCase();
-    if (['host', 'connection', 'content-length'].includes(k)) continue;
-    // Tukar referer/origin agar menunjuk ke origin asli.
+    // Header yang tidak boleh diteruskan / akan kita set ulang.
+    if (
+      [
+        'host',
+        'connection',
+        'content-length',
+        'x-forwarded-host',
+        'x-forwarded-proto',
+        'x-forwarded-for',
+        'forwarded',
+        'cf-connecting-ip',
+        'cf-ipcountry',
+        'cf-ray',
+        'cf-visitor',
+        'x-real-ip',
+      ].includes(k)
+    ) {
+      continue;
+    }
+    // Tukar referer/origin agar menunjuk ke origin asli (banyak API memvalidasi ini).
     if (k === 'referer' || k === 'origin') {
-      headers[key] = String(value).replace(ctx.mirrorHost, config.originHost);
+      headers[key] = String(value).replaceAll(ctx.mirrorHost, config.originHost);
       continue;
     }
     headers[key] = value;
   }
   headers['host'] = config.originHost;
-  // Minta konten tak terkompresi-spesifik supaya undici menanganinya konsisten.
+  // Pastikan API yang butuh konteks browser tidak menolak request.
+  if (!headers['user-agent'] && !headers['User-Agent']) {
+    headers['user-agent'] =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+  }
+  if (!headers['accept'] && !headers['Accept']) {
+    headers['accept'] = '*/*';
+  }
   headers['accept-encoding'] = 'gzip, deflate, br';
   return headers;
+}
+
+// Tulis-ulang header Set-Cookie agar cookie/sesi tersimpan di domain mirror.
+// - Domain=hchk.cards -> dibuang (cookie otomatis berlaku untuk host saat ini).
+// - SameSite=None tetap, tapi pastikan Secure ada bila mirror https.
+function rewriteSetCookie(cookieStr, ctx) {
+  let out = cookieStr
+    // Buang atribut Domain agar cookie melekat ke domain mirror.
+    .replace(/;\s*Domain=[^;]*/gi, '')
+    // Ganti sisa referensi host origin di value cookie (jarang, tapi aman).
+    .replaceAll(config.originHost, ctx.mirrorHost);
+
+  if (ctx.mirrorProtocol === 'https') {
+    if (/SameSite=None/i.test(out) && !/;\s*Secure/i.test(out)) {
+      out += '; Secure';
+    }
+  } else {
+    // Di http, cookie Secure tidak akan tersimpan -> buang flag Secure.
+    out = out.replace(/;\s*Secure/gi, '');
+  }
+  return out;
 }
 
 // Tulis-ulang header Location & Link agar menunjuk ke domain mirror.
@@ -140,9 +186,20 @@ app.use(async (req, res) => {
   const targetUrl = `${originBase()}${req.originalUrl}`;
 
   try {
+    const reqHeaders = buildOriginHeaders(req, ctx);
+    // Teruskan IP klien asli (banyak API rate-limit / log berbasis IP).
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
+      .toString()
+      .split(',')[0]
+      .trim();
+    if (clientIp) {
+      reqHeaders['x-forwarded-for'] = clientIp;
+      reqHeaders['x-real-ip'] = clientIp;
+    }
+
     const init = {
       method: req.method,
-      headers: buildOriginHeaders(req, ctx),
+      headers: reqHeaders,
       redirect: 'manual', // tangani redirect manual agar bisa di-rewrite.
     };
 
@@ -154,10 +211,11 @@ app.use(async (req, res) => {
 
     const originRes = await fetch(targetUrl, init);
 
-    // Salin header (kecuali hop-by-hop), rewrite Location/Link.
+    // Salin header (kecuali hop-by-hop), rewrite Location/Link & Set-Cookie.
     originRes.headers.forEach((value, key) => {
       const k = key.toLowerCase();
       if (HOP_BY_HOP.has(k)) return;
+      if (k === 'set-cookie') return; // ditangani khusus di bawah.
       if (config.forceIndexable && k === 'x-robots-tag') return; // buang noindex.
       if (k === 'location' || k === 'link') {
         res.setHeader(key, rewriteHeaderValue(value, ctx));
@@ -165,6 +223,18 @@ app.use(async (req, res) => {
       }
       res.setHeader(key, value);
     });
+
+    // Set-Cookie: ambil semua cookie (jangan tergabung), rewrite domain agar sesi jalan.
+    const setCookies =
+      typeof originRes.headers.getSetCookie === 'function'
+        ? originRes.headers.getSetCookie()
+        : [];
+    if (setCookies.length) {
+      res.setHeader(
+        'set-cookie',
+        setCookies.map((c) => rewriteSetCookie(c, ctx))
+      );
+    }
 
     res.status(originRes.status);
 
